@@ -1,5 +1,26 @@
-"""Pure logic: trim input -> share code, fetch from SportyBet, format result.
-No Telegram imports here so it can be tested on its own."""
+"""sportybet_endpoint.py - SportyBet endpoint client (proven working, all PDF endpoints).
+
+Covers every endpoint in Sportybet_endpoint.pdf:
+  create_code()      POST /api/ng/orders/share?throwInvalidEvent=true   -> new share code
+  fetch_code()       GET  /api/ng/orders/share/{code}?_t=...            -> decode a code
+  liability_check()  POST /api/ng/orders/liability/check
+  banned_events()    GET  /api/ng/factsCenter/banned/events?_t=...      -> list of banned event ids
+
+Why it works: CloudFront fingerprints the TLS/HTTP2 handshake. Plain `requests`
+gets an empty HTTP 202; `curl_cffi` impersonating Chrome gets the real JSON
+from SportyBet's origin. Verified from Render (AWS IP): GET share -> HTTP 200.
+(create/liability/banned use the same transport but are untested live.)
+
+Install:  pip install curl_cffi requests
+Library:  from sportybet_endpoint import (trim_code, fetch_code, format_decoded,
+              create_code, liability_check, banned_events, NetError)
+CLI:      python sportybet_endpoint.py decode RGXG82
+          python sportybet_endpoint.py raw RGXG82
+          python sportybet_endpoint.py banned
+          python sportybet_endpoint.py create sr:match:72466526,1,2 sr:match:68774340,1,2
+          python sportybet_endpoint.py liability sr:match:72466526,1,2
+          (selection = eventId,marketId,outcomeId ; bare 72466526 is read as sr:match:72466526)
+"""
 import html
 import re
 import time
@@ -24,7 +45,11 @@ NetError = (requests.RequestException, _CffiError)
 # Profile must match the User-Agent family. Tried in order until one is supported.
 IMPERSONATE_PROFILES = ("chrome131_android", "chrome124", "chrome120", "chrome")
 
-BASE_URL = "https://www.sportybet.com/api/ng/orders/share/"
+API = "https://www.sportybet.com/api/ng"
+BASE_URL = f"{API}/orders/share/"  # GET + code
+SHARE_URL = f"{API}/orders/share"  # POST create
+LIABILITY_URL = f"{API}/orders/liability/check"
+BANNED_URL = f"{API}/factsCenter/banned/events"
 # No User-Agent here on purpose: impersonate= sends the matching one.
 HEADERS = {
     "Accept": "application/json, text/plain, */*",
@@ -62,16 +87,42 @@ def _get_session():
     raise RuntimeError("No usable curl_cffi impersonation profile")
 
 
-def http_get(url: str, params=None, timeout: int = 20, retries: int = 3):
-    """GET with browser fingerprint; retries empty/202 edge responses with jitter."""
+def _request(method: str, url: str, params=None, payload=None, timeout: int = 20, retries: int = 3):
+    """Browser-fingerprinted request; retries empty/202 edge responses with jitter."""
     sess = _get_session()
+    headers = dict(HEADERS)
+    kwargs = {"params": params, "headers": headers, "timeout": timeout}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        kwargs["json"] = payload
     resp = None
     for attempt in range(retries):
-        resp = sess.get(url, params=params, headers=HEADERS, timeout=timeout)
+        resp = sess.request(method, url, **kwargs)
         if resp.status_code != 202 and resp.content:
             return resp
         time.sleep(0.6 * (attempt + 1) + random.random() * 0.5)
     return resp
+
+
+def http_get(url: str, params=None, timeout: int = 20, retries: int = 3):
+    return _request("GET", url, params=params, timeout=timeout, retries=retries)
+
+
+def http_post(url: str, payload, params=None, timeout: int = 20, retries: int = 3):
+    return _request("POST", url, params=params, payload=payload, timeout=timeout, retries=retries)
+
+
+def _as_dict(resp, started: float) -> dict:
+    """Parse JSON body into a dict and attach diagnostics."""
+    try:
+        body = resp.json()
+    except ValueError:
+        body = {"_raw": resp.text[:500]}
+    if not isinstance(body, dict):
+        body = {"_raw": str(body)[:500]}
+    body["_http_status"] = resp.status_code
+    body["_elapsed_ms"] = round((time.time() - started) * 1000)
+    return body
 
 
 # ---------- trimming ----------
@@ -115,23 +166,82 @@ def trim_code(raw: str):
 
 # ---------- fetching ----------
 def fetch_code(code: str, timeout: int = 20) -> dict:
-    """GET the share endpoint. Always returns a dict with diagnostics."""
+    """GET /orders/share/{code}. Always returns a dict with diagnostics."""
     started = time.time()
-    resp = http_get(
-        f"{BASE_URL}{code}",
-        params={"_t": int(time.time() * 1000)},
-        timeout=timeout,
-    )
-    elapsed = round((time.time() - started) * 1000)
+    resp = http_get(f"{BASE_URL}{code}", params={"_t": int(time.time() * 1000)}, timeout=timeout)
+    return _as_dict(resp, started)
+
+
+# ---------- other endpoints ----------
+def normalize_selection(sel) -> dict:
+    """Accept 'eventId,marketId,outcomeId' or a dict; return an API selection dict."""
+    if isinstance(sel, str):
+        parts = [p.strip() for p in sel.split(",")]
+        if len(parts) < 3:
+            raise ValueError(f"Selection needs eventId,marketId,outcomeId: {sel!r}")
+        sel = {"eventId": parts[0], "marketId": parts[1], "outcomeId": parts[2]}
+    ev = str(sel["eventId"])
+    if ev.isdigit():
+        ev = f"sr:match:{ev}"
+    return {
+        "eventId": ev,
+        "marketId": str(sel["marketId"]),
+        "outcomeId": str(sel["outcomeId"]),
+        "specifier": sel.get("specifier"),
+    }
+
+
+def selections_from_decoded(data: dict) -> list:
+    """Pull re-creatable selections out of a fetch_code() result."""
+    ticket = ((data.get("data") or {}).get("ticket")) or {}
+    return [normalize_selection(s) for s in ticket.get("selections") or []]
+
+
+def create_code(selections, bet_type: str = "MULTIPLE", stake: int = 1000000, timeout: int = 20) -> dict:
+    """POST /orders/share?throwInvalidEvent=true -> new share code in data.shareCode.
+
+    selections: list of 'eventId,marketId,outcomeId' strings or dicts.
+    stake/orderType mirror the documented request (stake 1000000, orderType 2).
+    """
+    sels = []
+    for s in selections:
+        n = normalize_selection(s)
+        n["stake"] = stake
+        sels.append(n)
+    payload = {"selections": sels, "orderType": 2, "betType": bet_type}
+    started = time.time()
+    resp = http_post(SHARE_URL, payload, params={"throwInvalidEvent": "true"}, timeout=timeout)
+    return _as_dict(resp, started)
+
+
+def liability_check(selections, sport_id: str = "sr:sport:1", timeout: int = 20) -> dict:
+    """POST /orders/liability/check (documented processors: ["10"])."""
+    sels = []
+    for s in selections:
+        n = normalize_selection(s)
+        sels.append({
+            "eventId": n["eventId"],
+            "marketId": n["marketId"],
+            "sportId": sport_id,
+            "outcomeId": n["outcomeId"],
+            "childSelections": [],
+            "isLive": False,
+        })
+    payload = {"selections": sels, "liabilityCheckProcessors": ["10"]}
+    started = time.time()
+    resp = http_post(LIABILITY_URL, payload, timeout=timeout)
+    return _as_dict(resp, started)
+
+
+def banned_events(timeout: int = 20) -> list:
+    """GET /factsCenter/banned/events -> list of banned event ids (empty on failure)."""
+    resp = http_get(BANNED_URL, params={"_t": int(time.time() * 1000)}, timeout=timeout)
     try:
         body = resp.json()
     except ValueError:
-        body = {"_raw": resp.text[:500]}
-    if not isinstance(body, dict):
-        body = {"_raw": str(body)[:500]}
-    body["_http_status"] = resp.status_code
-    body["_elapsed_ms"] = elapsed
-    return body
+        return []
+    data = body.get("data") if isinstance(body, dict) else None
+    return data if isinstance(data, list) else []
 
 
 # ---------- formatting ----------
@@ -247,3 +357,45 @@ def fetch_raw(code: str, timeout: int = 20) -> str:
     body = resp.text[:300].replace("\n", " ") or "(empty body)"
     out.append(f"Body: {body}")
     return "\n".join(out)
+
+
+# ---------- CLI (handy in Termux) ----------
+def _plain(text: str) -> str:
+    return re.sub(r"<[^>]+>", "", html.unescape(text))
+
+
+if __name__ == "__main__":
+    import json
+    import sys
+
+    argv = [a for a in sys.argv[1:] if a != "--raw"]
+    cmd = argv[0].lower() if argv else "decode"
+    if cmd in ("decode", "raw", "banned", "create", "liability"):
+        argv = argv[1:]
+    else:
+        cmd = "raw" if "--raw" in sys.argv else "decode"
+    try:
+        if cmd == "banned":
+            ids = banned_events()
+            print(f"{len(ids)} banned events")
+            print("\n".join(ids[:20]) + ("\n..." if len(ids) > 20 else ""))
+        elif cmd in ("create", "liability"):
+            if not argv:
+                sys.exit("Give at least one selection: eventId,marketId,outcomeId")
+            res = create_code(argv) if cmd == "create" else liability_check(argv)
+            if cmd == "create":
+                d = res.get("data") or {}
+                print(f"HTTP {res['_http_status']} | bizCode {res.get('bizCode')} | {res.get('message')}")
+                print("Share code:", d.get("shareCode"), "|", d.get("shareURL"))
+            else:
+                print(json.dumps(res, indent=2)[:1500])
+        else:
+            code = trim_code(" ".join(argv)) if argv else SAMPLE_CODE
+            if not code:
+                sys.exit("No share code found in input.")
+            if cmd == "raw":
+                print(fetch_raw(code))
+            else:
+                print(_plain(format_decoded(fetch_code(code), code)))
+    except NetError as exc:
+        sys.exit(f"Network error: {type(exc).__name__}: {exc}")

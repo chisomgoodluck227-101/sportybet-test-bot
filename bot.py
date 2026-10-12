@@ -6,7 +6,13 @@ from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from decoder import NetError, SAMPLE_CODE, fetch_code, fetch_raw, format_decoded, trim_code
+import html
+import re
+
+from sportybet_endpoint import (
+    NetError, SAMPLE_CODE, create_code, fetch_code, fetch_raw, format_decoded, trim_code,
+)
+from slip_tools import leg_line, legs_from_decoded, merge_slips, total_odds, trim_to_target
 from healthcheck import start_health_server
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -20,7 +26,9 @@ HELP = (
     "/decode XML9Z7 – decode a code\n"
     "/test – decode the sample code from the PDF\n"
     "/ping – check if SportyBet is reachable from this server\n"
-    "/raw CODE – show server IP + raw SportyBet response (debug)"
+    "/raw CODE – show server IP + raw SportyBet response (debug)\n"
+    "/trim CODE 5.0 – trim a slip down to target total odds (add 'near' for closest either side)\n"
+    "/merge CODE1 CODE2 … – merge several codes into one new code"
 )
 
 
@@ -79,6 +87,143 @@ async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ {type(exc).__name__}: {exc}"[:3900])
 
 
+# ---------- /trim and /merge ----------
+async def _decode_legs(code: str):
+    """Fetch + parse a code. Returns (legs, error_text)."""
+    data = await asyncio.to_thread(fetch_code, code)
+    legs = legs_from_decoded(data)
+    if data.get("bizCode") not in (None, 10000) or not legs:
+        reason = data.get("message") or data.get("_raw") or "no selections"
+        return None, f"{code}: {str(reason)[:120]} (HTTP {data.get('_http_status', '?')})"
+    return legs, None
+
+
+async def _publish(legs):
+    """Create a new share code from legs. Returns (code, url, error_text)."""
+    res = await asyncio.to_thread(create_code, legs)
+    data = res.get("data") if isinstance(res.get("data"), dict) else {}
+    if res.get("bizCode") not in (None, 10000) or not data.get("shareCode"):
+        reason = res.get("message") or res.get("innerMsg") or res.get("_raw") or "unknown error"
+        return None, None, f"bizCode {res.get('bizCode')} | HTTP {res.get('_http_status')} | {str(reason)[:200]}"
+    return data["shareCode"], data.get("shareURL"), None
+
+
+async def trim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    usage = "Usage: /trim CODE TARGET_ODDS [near]\nExample: /trim RGXG82 5.0"
+    if len(args) < 2:
+        await update.message.reply_text(usage)
+        return
+    code = trim_code(args[0])
+    try:
+        target = float(args[1].replace(",", "."))
+        if target <= 1:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Target odds must be a number above 1.\n" + usage)
+        return
+    mode = "near" if len(args) > 2 and args[2].lower() == "near" else "below"
+    if not code:
+        await update.message.reply_text("I couldn't find a share code in that.\n" + usage)
+        return
+
+    status = await update.message.reply_text(f"Trimming {code} to ~{target:g}…")
+    try:
+        legs, err = await _decode_legs(code)
+        if err:
+            await status.edit_text(f"❌ Could not decode {html.escape(err)}", parse_mode="HTML")
+            return
+        priced = [l for l in legs if l["odds"] is not None]
+        unpriced = [l for l in legs if l["odds"] is None]
+        if not priced:
+            await status.edit_text("❌ No selection on that slip has odds available right now.")
+            return
+
+        before = total_odds(priced)
+        kept, removed, note = trim_to_target(priced, target, mode)
+        removed = removed + unpriced
+        esc = html.escape
+        lines = [f"✂️ <b>Trim {esc(code)}</b> → target {target:g} ({'closest' if mode == 'near' else 'at or below'})",
+                 f"Before: <b>{before:.2f}</b> ({len(legs)} sel) | After: <b>{total_odds(kept):.2f}</b> ({len(kept)} sel)"]
+        if note:
+            lines.append(f"⚠️ {esc(note)}")
+        lines += ["", "<b>Kept</b>"] + [leg_line(i, l, esc) for i, l in enumerate(kept, 1)]
+        if removed:
+            lines += ["", "<b>Removed</b>"] + [leg_line(None, l, esc) for l in removed]
+
+        if not removed:
+            lines.append("\nNothing to trim - slip is already within target. No new code created.")
+        else:
+            new_code, url, perr = await _publish(kept)
+            if perr:
+                lines += ["", f"❌ Could not create new code: {esc(perr)}"]
+            else:
+                lines += ["", f"🔑 New code: <code>{esc(new_code)}</code>"]
+                if url:
+                    lines.append(f'<a href="{esc(url)}">Open slip on SportyBet</a>')
+        await status.edit_text("\n".join(lines)[:3900], parse_mode="HTML", disable_web_page_preview=True)
+    except NetError as exc:
+        await status.edit_text(f"❌ Could not reach SportyBet: {type(exc).__name__}")
+    except Exception:
+        log.exception("Trim failed")
+        await status.edit_text("❌ Unexpected error. Check the Render logs.")
+
+
+async def merge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = " ".join(context.args or [])
+    tokens = [t for t in re.split(r"[\s,;]+", raw) if t]
+    codes = []
+    for t in tokens:
+        c = trim_code(t)
+        if c and c not in codes:
+            codes.append(c)
+    if len(codes) < 2:
+        await update.message.reply_text("Usage: /merge CODE1 CODE2 [CODE3 …]")
+        return
+
+    status = await update.message.reply_text(f"Merging {len(codes)} codes…")
+    try:
+        slips, errors = [], []
+        for c in codes:
+            legs, err = await _decode_legs(c)
+            if err:
+                errors.append(err)
+            else:
+                slips.append(legs)
+        esc = html.escape
+        if errors:
+            await status.edit_text("❌ Could not decode:\n" + "\n".join(esc(e) for e in errors),
+                                   parse_mode="HTML")
+            return
+
+        merged, dups, conflicts = merge_slips(slips)
+        priced = [l for l in merged if l["odds"] is not None]
+        lines = [f"🔗 <b>Merged {len(codes)} codes</b> → {len(merged)} selections"]
+        if dups:
+            lines.append(f"Duplicates dropped: {len(dups)}")
+        if conflicts:
+            lines.append(f"Conflicts skipped (same match, different pick): {len(conflicts)}")
+            for leg, kept_leg in conflicts:
+                lines.append(f"  ⚠️ {esc(leg['title'])}: skipped {esc(str(leg['pick']))}, kept {esc(str(kept_leg['pick']))}")
+        if len(priced) == len(merged):
+            lines.append(f"Total odds: <b>{total_odds(merged):.2f}</b>")
+        lines += [""] + [leg_line(i, l, esc) for i, l in enumerate(merged, 1)]
+
+        new_code, url, perr = await _publish(merged)
+        if perr:
+            lines += ["", f"❌ Could not create new code: {esc(perr)}"]
+        else:
+            lines += ["", f"🔑 New code: <code>{esc(new_code)}</code>"]
+            if url:
+                lines.append(f'<a href="{esc(url)}">Open slip on SportyBet</a>')
+        await status.edit_text("\n".join(lines)[:3900], parse_mode="HTML", disable_web_page_preview=True)
+    except NetError as exc:
+        await status.edit_text(f"❌ Could not reach SportyBet: {type(exc).__name__}")
+    except Exception:
+        log.exception("Merge failed")
+        await status.edit_text("❌ Unexpected error. Check the Render logs.")
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_decode(update, update.message.text or "")
 
@@ -106,6 +251,8 @@ def main():
     app.add_handler(CommandHandler("test", test_command))
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("raw", raw_command))
+    app.add_handler(CommandHandler("trim", trim_command))
+    app.add_handler(CommandHandler("merge", merge_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)

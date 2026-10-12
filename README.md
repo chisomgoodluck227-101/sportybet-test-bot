@@ -3,7 +3,9 @@
 Telegram bot that trims pasted input to a share code and decodes it via
 `GET https://www.sportybet.com/api/ng/orders/share/{code}`.
 
-Commands: `/decode CODE`, `/test` (sample code), `/ping` (is SportyBet reachable from Render?), or just paste a code/link.
+Commands: `/decode CODE`, `/trim CODE TARGET [near]`, `/merge CODE1 CODE2 …`, `/test`, `/ping`, `/raw CODE`, or just paste a code/link.
+
+`/trim` keeps the subset of picks whose total odds is closest to the target without going over (add `near` to allow either side), then creates a new share code. `/merge` combines codes, drops duplicate picks, skips conflicting picks on the same match, and creates a new share code.
 
 ## Render setup
 - Service type: **Web Service** (this bot opens a port on `$PORT`, so Render's port check passes).
