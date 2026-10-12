@@ -1,22 +1,17 @@
-# SportyBet Code Decoder Telegram Bot
+# SportyBet decode test bot
 
-This is a Telegram interface for decoding SportyBet share codes using the endpoint documented in the supplied endpoint PDF:
+Telegram bot that trims pasted input to a share code and decodes it via
+`GET https://www.sportybet.com/api/ng/orders/share/{code}`.
 
-`GET https://www.sportybet.com/api/ng/orders/share/{shareCode}?_t={timestamp}`
+Commands: `/decode CODE`, `/test` (sample code), `/ping` (is SportyBet reachable from Render?), or just paste a code/link.
 
-## Telegram usage
-- `/start` — instructions
-- `/decode XML9Z7` — decode a share code
-- Or send the share code by itself, e.g. `XML9Z7`
+## Render setup
+- Service type: **Web Service** (this bot opens a port on `$PORT`, so Render's port check passes).
+  If you use a *Background Worker* instead, no port is needed, but it isn't free.
+- Build: `pip install -r requirements.txt`  |  Start: `python bot.py`
+- Env var: `TELEGRAM_BOT_TOKEN`
+- Free web services sleep after ~15 min idle; use an uptime pinger on the Render URL to keep it awake.
 
-The bot retrieves the shared ticket details returned by SportyBet. It does not place bets or access a user's account. A code can fail if it is invalid, expired, removed, or the endpoint blocks the request.
-
-## Deploy on Render
-1. Push this folder to a GitHub repository.
-2. On Render, create a **Background Worker** from that repository.
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `python bot.py`
-5. Add environment variable `TELEGRAM_BOT_TOKEN` with your BotFather token.
-6. Deploy and open your Telegram bot.
-
-Do not commit your Telegram token to GitHub.
+## "Conflict: terminated by other getUpdates request"
+Only ONE process may poll a token. Stop any local run, any old Render service
+(old worker + new web service), and avoid manual deploys overlapping.
