@@ -1,127 +1,106 @@
 import os
 import time
-import json
 import logging
-from typing import Any
-
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+BASE_URL = "https://www.sportybet.com/api/ng/orders/share/"
+HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json, text/plain, */*",
+    "Origin": "https://www.sportybet.com",
+    "Referer": "https://www.sportybet.com/ng/",
+}
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
-logging.getLogger("httpx").setLevel(logging.WARNING)
-log = logging.getLogger("sportybet-test-bot")
-
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-API_BASE = "https://www.sportybet.com/api/ng"
-HTTP_TIMEOUT = 15
-
-# Example IDs copied from the supplied endpoint capture. They may be expired now.
-SAMPLE_SELECTIONS = [
-    {
-        "eventId": "sr:match:72466526",
-        "marketId": "1",
-        "specifier": None,
-        "outcomeId": "2",
-        "stake": 1000000,
-    },
-    {
-        "eventId": "sr:match:68774340",
-        "marketId": "1",
-        "specifier": None,
-        "outcomeId": "2",
-        "stake": 1000000,
-    },
-    {
-        "eventId": "sr:match:72388006",
-        "marketId": "1",
-        "specifier": None,
-        "outcomeId": "2",
-        "stake": 1000000,
-    },
-]
-
-LIABILITY_SELECTIONS = [
-    {
-        "eventId": item["eventId"],
-        "marketId": item["marketId"],
-        "sportId": "sr:sport:1",
-        "outcomeId": item["outcomeId"],
-        "childSelections": [],
-        "isLive": False,
-    }
-    for item in SAMPLE_SELECTIONS
-]
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Origin": "https://www.sportybet.com",
-    "Referer": "https://www.sportybet.com/ng/",
-})
+log = logging.getLogger(__name__)
 
 
-def api_request(method: str, path: str, payload: dict | None = None):
-    url = f"{API_BASE}{path}"
-    started = time.perf_counter()
+def decode_code(code: str) -> dict:
+    url = f"{BASE_URL}{code}"
+    response = requests.get(
+        url,
+        params={"_t": int(time.time() * 1000)},
+        headers=HEADERS,
+        timeout=20,
+    )
+    response.raise_for_status()
     try:
-        response = SESSION.request(
-            method,
-            url,
-            params={"_t": int(time.time() * 1000)} if method.upper() == "GET" else None,
-            json=payload,
-            timeout=HTTP_TIMEOUT,
+        return response.json()
+    except ValueError:
+        return {"_http_status": response.status_code, "_raw": response.text[:3000]}
+
+
+def format_decoded(data: dict, code: str) -> str:
+    if not isinstance(data, dict):
+        return f"SportyBet returned an unexpected response for code {code}."
+
+    biz_code = data.get("bizCode")
+    message = data.get("message", "")
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    ticket = payload.get("ticket", {}) if isinstance(payload, dict) else {}
+    selections = ticket.get("selections", []) if isinstance(ticket, dict) else []
+    outcomes = payload.get("outcomes", []) if isinstance(payload, dict) else []
+
+    if biz_code not in (None, 10000) or not selections:
+        details = message or data.get("_raw") or "No selections were returned."
+        return (
+            f"❌ *Could not decode code:* `{code}`\n"
+            f"Status: `{biz_code if biz_code is not None else data.get('_http_status', 'unknown')}`\n"
+            f"Message: {str(details)[:700]}"
         )
-        elapsed = round((time.perf_counter() - started) * 1000)
-        try:
-            body: Any = response.json()
-        except ValueError:
-            body = response.text[:1200]
-        return {
-            "ok": response.ok,
-            "status": response.status_code,
-            "ms": elapsed,
-            "body": body,
-        }
-    except requests.RequestException as exc:
-        return {"ok": False, "status": None, "ms": None, "error": str(exc)}
 
+    # Match event details returned in outcomes to the selection event IDs.
+    by_event = {}
+    for item in outcomes if isinstance(outcomes, list) else []:
+        if isinstance(item, dict):
+            by_event[item.get("eventId")] = item
 
-def short_result(label: str, result: dict) -> str:
-    status = result.get("status")
-    ms = result.get("ms")
-    timing = f"{ms} ms" if ms is not None else "n/a"
-    if status is None:
-        return f"{label}: CONNECTION ERROR\nTime: {timing}\n{result.get('error', 'Unknown error')}"
-    body = result.get("body")
-    if isinstance(body, dict):
-        biz = body.get("bizCode", "n/a")
-        message = body.get("message", "")
-        available = body.get("isAvailable", "n/a")
-        detail = f"bizCode: {biz}\nAvailable: {available}\nMessage: {message}"
-    else:
-        sample = str(body or "").replace("\n", " ")[:240]
-        detail = f"Body: {sample}"
-    return f"{label}: HTTP {status}\nTime: {timing}\n{detail}"
+    lines = [
+        f"✅ *SportyBet code decoded*",
+        f"Code: `{payload.get('shareCode', code)}`",
+        f"Bet type: `{ticket.get('betType', payload.get('betType', 'Unknown'))}`",
+        f"Selections: *{len(selections)}*",
+        "",
+    ]
+
+    for idx, sel in enumerate(selections, 1):
+        if not isinstance(sel, dict):
+            continue
+        event_id = sel.get("eventId", "Unknown event")
+        detail = by_event.get(event_id, {})
+        home = detail.get("homeTeamName")
+        away = detail.get("awayTeamName")
+        match = f"{home} vs {away}" if home and away else event_id
+        market_id = sel.get("marketId", "?")
+        outcome_id = sel.get("outcomeId", "?")
+        odds = sel.get("odds")
+        if odds is None:
+            # Some responses keep market/outcome labels under markets.
+            odds = detail.get("odds")
+        lines.append(f"*{idx}. {match}*")
+        lines.append(f"   Market ID: `{market_id}` | Outcome ID: `{outcome_id}`")
+        if odds is not None:
+            lines.append(f"   Odds: `{odds}`")
+
+    share_url = payload.get("shareURL") if isinstance(payload, dict) else None
+    if share_url:
+        lines.extend(["", f"[Open slip on SportyBet]({share_url})"])
+
+    return "\n".join(lines)[:3900]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(
-        "SportyBet Endpoint Test Bot\n\n"
-        "Commands:\n"
-        "/test — basic API reachability and share-code retrieval\n"
-        "/liability — test the documented liability-check endpoint\n"
-        "/share — try creating a share slip with sample selections\n"
-        "/help — show this menu\n\n"
-        "This is a diagnostic test only. It does not place a real-money bet. "
-        "The sample event IDs in the PDF may be expired."
+    await update.message.reply_text(
+        "SportyBet Code Decoder\n\n"
+        "Send a SportyBet share code (for example: XML9Z7), or use:\n"
+        "/decode XML9Z7\n\n"
+        "This retrieves the shared slip details from SportyBet. It does not place bets."
     )
 
 
@@ -129,91 +108,61 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
 
-async def test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.effective_message.reply_text("Testing SportyBet API from the Render bot...")
-    # Endpoint explicitly documented in the supplied PDF.
-    banned = api_request("GET", "/factsCenter/banned/events")
-    # Sample share code copied from the capture; it may no longer exist.
-    share = api_request("GET", "/orders/share/XML9Z7")
-
-    text = (
-        "SPORTYBET API TEST\n\n"
-        + short_result("1) Banned-events endpoint", banned)
-        + "\n\n"
-        + short_result("2) Retrieve sample share code XML9Z7", share)
-        + "\n\nInterpretation:\n"
-        "• HTTP response means Render reached the server.\n"
-        "• HTTP 200 with bizCode 10000 indicates API-level success for that request.\n"
-        "• 403/429 may indicate anti-bot/rate limiting; 404 or an API error for XML9Z7 "
-        "may simply mean the sample code expired.\n"
-        "• This test does not confirm that every endpoint or real-money betting works."
-    )
-    await msg.edit_text(text)
+async def decode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /decode SPORTYBET_CODE\nExample: /decode XML9Z7")
+        return
+    code = context.args[0].strip().upper()
+    await handle_code(update, code)
 
 
-async def liability_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.effective_message.reply_text("Testing liability/check...")
-    result = api_request(
-        "POST",
-        "/orders/liability/check",
-        {
-            "selections": LIABILITY_SELECTIONS,
-            "liabilityCheckProcessors": ["10"],
-        },
-    )
-    await msg.edit_text(
-        "LIABILITY CHECK TEST\n\n"
-        + short_result("POST /orders/liability/check", result)
-        + "\n\nThe captured event IDs are examples from the PDF and may be expired. "
-        "An unavailable-selection response does not by itself prove the endpoint is broken."
-    )
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+    # Accept a code pasted by itself; reject long sentences to avoid accidental calls.
+    if len(text) <= 40 and " " not in text and all(c.isalnum() or c in "-_" for c in text):
+        await handle_code(update, text.upper())
+    else:
+        await update.message.reply_text(
+            "Send only the SportyBet share code, or use /decode CODE."
+        )
 
 
-async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.effective_message.reply_text("Trying share-slip creation with sample selections...")
-    result = api_request(
-        "POST",
-        "/orders/share?throwInvalidEvent=true",
-        {
-            "selections": SAMPLE_SELECTIONS,
-            "orderType": 2,
-            "betType": "MULTIPLE",
-        },
-    )
-    body = result.get("body")
-    extra = ""
-    if isinstance(body, dict):
-        data = body.get("data") or {}
-        code = data.get("shareCode")
-        url = data.get("shareURL")
-        if code:
-            extra = f"\n\nShare code: {code}"
-        if url:
-            extra += f"\nShare URL: {url}"
-    await msg.edit_text(
-        "SHARE-SLIP CREATION TEST\n\n"
-        + short_result("POST /orders/share", result)
-        + extra
-        + "\n\nThis creates a shareable slip only; it does not submit a real-money wager. "
-        "The example fixture IDs may be expired."
-    )
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.exception("Unhandled bot error", exc_info=context.error)
+async def handle_code(update: Update, code: str):
+    if not code or len(code) > 40 or not all(c.isalnum() or c in "-_" for c in code):
+        await update.message.reply_text("That code format looks invalid. Send the share code only.")
+        return
+    status = await update.message.reply_text(f"Decoding SportyBet code `{code}`…", parse_mode="Markdown")
+    try:
+        data = await __import__("asyncio").to_thread(decode_code, code)
+        result = format_decoded(data, code)
+        await status.edit_text(result, parse_mode="Markdown", disable_web_page_preview=True)
+    except requests.HTTPError as exc:
+        code_status = exc.response.status_code if exc.response is not None else "unknown"
+        await status.edit_text(
+            f"❌ SportyBet returned HTTP {code_status} for `{code}`.\n"
+            "The code may be invalid/expired, or SportyBet may be blocking the request.",
+            parse_mode="Markdown",
+        )
+    except requests.RequestException as exc:
+        log.warning("SportyBet request failed: %s", exc)
+        await status.edit_text(
+            "❌ Could not reach SportyBet right now. Check the endpoint/network and try again."
+        )
+    except Exception:
+        log.exception("Decode failed")
+        await status.edit_text("❌ Unexpected decoding error. Check the Render logs.")
 
 
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN environment variable")
-    app = Application.builder().token(BOT_TOKEN).build()
+    if not TOKEN:
+        raise RuntimeError("Set TELEGRAM_BOT_TOKEN in the environment.")
+    app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CommandHandler("test", test_command))
-    app.add_handler(CommandHandler("liability", liability_command))
-    app.add_handler(CommandHandler("share", share_command))
-    app.add_error_handler(error_handler)
-    log.info("Starting SportyBet endpoint test bot using Telegram long polling")
+    app.add_handler(CommandHandler("decode", decode_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling(drop_pending_updates=True)
 
 

@@ -1,20 +1,22 @@
-# SportyBet Endpoint Test Bot
+# SportyBet Code Decoder Telegram Bot
 
-A minimal Telegram bot built from scratch using the endpoints documented in `Sportybet endpoint.pdf`.
+This is a Telegram interface for decoding SportyBet share codes using the endpoint documented in the supplied endpoint PDF:
 
-## Commands
-- `/test` — checks the banned-events endpoint and attempts to retrieve the example share code `XML9Z7`.
-- `/liability` — sends the example payload to `/orders/liability/check`.
-- `/share` — attempts to create a share slip from the sample fixture IDs in the PDF.
+`GET https://www.sportybet.com/api/ng/orders/share/{shareCode}?_t={timestamp}`
 
-The sample fixture IDs/share code may have expired. A failed sample request is not conclusive evidence that an endpoint is broken. This bot does not place a real-money wager.
+## Telegram usage
+- `/start` — instructions
+- `/decode XML9Z7` — decode a share code
+- Or send the share code by itself, e.g. `XML9Z7`
+
+The bot retrieves the shared ticket details returned by SportyBet. It does not place bets or access a user's account. A code can fail if it is invalid, expired, removed, or the endpoint blocks the request.
 
 ## Deploy on Render
-1. Upload `bot.py`, `requirements.txt`, and `render.yaml` to a new GitHub repository.
-2. In Render, create a **Background Worker** from that repository.
-3. Set the build command to `pip install -r requirements.txt`.
-4. Set the start command to `python bot.py`.
-5. Add environment variable `TELEGRAM_BOT_TOKEN` with the token from BotFather.
-6. Deploy, then open your Telegram bot and send `/start`, followed by `/test`.
+1. Push this folder to a GitHub repository.
+2. On Render, create a **Background Worker** from that repository.
+3. Build command: `pip install -r requirements.txt`
+4. Start command: `python bot.py`
+5. Add environment variable `TELEGRAM_BOT_TOKEN` with your BotFather token.
+6. Deploy and open your Telegram bot.
 
-Do not put your Telegram token in the source code or commit it to GitHub.
+Do not commit your Telegram token to GitHub.
