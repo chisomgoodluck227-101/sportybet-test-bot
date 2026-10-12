@@ -2,12 +2,11 @@ import asyncio
 import logging
 import os
 
-import requests
 from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from decoder import SAMPLE_CODE, fetch_code, fetch_raw, format_decoded, trim_code
+from decoder import NetError, SAMPLE_CODE, fetch_code, fetch_raw, format_decoded, trim_code
 from healthcheck import start_health_server
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -40,7 +39,7 @@ async def run_decode(update: Update, raw: str):
         await status.edit_text(
             format_decoded(data, code), parse_mode="HTML", disable_web_page_preview=True
         )
-    except requests.RequestException as exc:
+    except NetError as exc:
         log.warning("SportyBet request failed: %s", exc)
         await status.edit_text(f"❌ Could not reach SportyBet: {type(exc).__name__}")
     except Exception:
@@ -67,7 +66,7 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"{verdict}\nHTTP {st} | bizCode {data.get('bizCode')} | {data.get('_elapsed_ms')} ms"
         )
-    except requests.RequestException as exc:
+    except NetError as exc:
         await update.message.reply_text(f"❌ Not reachable: {type(exc).__name__}: {exc}")
 
 
@@ -76,7 +75,7 @@ async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         text = await asyncio.to_thread(fetch_raw, code)
         await update.message.reply_text(f"Code: {code}\n{text}"[:3900])
-    except requests.RequestException as exc:
+    except NetError as exc:
         await update.message.reply_text(f"❌ {type(exc).__name__}: {exc}"[:3900])
 
 

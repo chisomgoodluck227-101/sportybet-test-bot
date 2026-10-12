@@ -5,20 +5,73 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 
-import requests
+import random
+
+import requests  # plain client: only used for the ipinfo diagnostic
+
+try:  # browser-grade TLS/HTTP2 fingerprint (JA3/JA4) via curl_cffi
+    from curl_cffi import requests as cffi
+    from curl_cffi.requests.exceptions import RequestException as _CffiError
+    HAS_CFFI = True
+except ImportError:  # falls back to plain requests (will likely get 202'd)
+    cffi = None
+    _CffiError = requests.RequestException
+    HAS_CFFI = False
+
+# Catch this in bot.py instead of requests.RequestException
+NetError = (requests.RequestException, _CffiError)
+
+# Profile must match the User-Agent family. Tried in order until one is supported.
+IMPERSONATE_PROFILES = ("chrome131_android", "chrome124", "chrome120", "chrome")
 
 BASE_URL = "https://www.sportybet.com/api/ng/orders/share/"
+# No User-Agent here on purpose: impersonate= sends the matching one.
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
-    ),
     "Accept": "application/json, text/plain, */*",
     "Origin": "https://www.sportybet.com",
     "Referer": "https://www.sportybet.com/ng/",
 }
 SAMPLE_CODE = "XML9Z7"  # from the endpoint PDF (may have expired)
 WAT = timezone(timedelta(hours=1))  # Nigeria time
+
+
+# ---------- http layer ----------
+_session = None
+_profile = None
+
+
+def _get_session():
+    """One persistent session so cookies (e.g. WAF tokens) survive between calls."""
+    global _session, _profile
+    if _session is not None:
+        return _session
+    if not HAS_CFFI:
+        _session = requests.Session()
+        _session.headers["User-Agent"] = (
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Mobile Safari/537.36"
+        )
+        return _session
+    for prof in IMPERSONATE_PROFILES:
+        try:
+            _session = cffi.Session(impersonate=prof)
+            _profile = prof
+            return _session
+        except Exception:  # noqa: BLE001 - profile not in this curl_cffi build
+            continue
+    raise RuntimeError("No usable curl_cffi impersonation profile")
+
+
+def http_get(url: str, params=None, timeout: int = 20, retries: int = 3):
+    """GET with browser fingerprint; retries empty/202 edge responses with jitter."""
+    sess = _get_session()
+    resp = None
+    for attempt in range(retries):
+        resp = sess.get(url, params=params, headers=HEADERS, timeout=timeout)
+        if resp.status_code != 202 and resp.content:
+            return resp
+        time.sleep(0.6 * (attempt + 1) + random.random() * 0.5)
+    return resp
 
 
 # ---------- trimming ----------
@@ -64,10 +117,9 @@ def trim_code(raw: str):
 def fetch_code(code: str, timeout: int = 20) -> dict:
     """GET the share endpoint. Always returns a dict with diagnostics."""
     started = time.time()
-    resp = requests.get(
+    resp = http_get(
         f"{BASE_URL}{code}",
         params={"_t": int(time.time() * 1000)},
-        headers=HEADERS,
         timeout=timeout,
     )
     elapsed = round((time.time() - started) * 1000)
@@ -180,12 +232,12 @@ def fetch_raw(code: str, timeout: int = 20) -> str:
     except Exception as exc:  # noqa: BLE001
         out.append(f"IP lookup failed: {type(exc).__name__}")
 
-    resp = requests.get(
+    resp = http_get(
         f"{BASE_URL}{code}",
         params={"_t": int(time.time() * 1000)},
-        headers=HEADERS,
         timeout=timeout,
     )
+    out.append(f"Client: {'curl_cffi/' + str(_profile) if HAS_CFFI else 'plain requests (no fingerprint)'}")
     out.append(f"HTTP {resp.status_code} | {len(resp.content)} bytes")
     keep = ("content-type", "server", "biz-code", "biz-code-message",
             "request-country", "x-cache", "via", "location", "retry-after")
