@@ -167,3 +167,31 @@ def format_decoded(data: dict, code: str) -> str:
         lines.append(f'<a href="{esc(url)}">Open slip on SportyBet</a>')
     lines.append(f"<i>fetched in {data.get('_elapsed_ms', '?')} ms</i>")
     return "\n".join(lines)[:3900]
+
+
+# ---------- diagnostics ----------
+def fetch_raw(code: str, timeout: int = 20) -> str:
+    """Plain-text diagnostic: where this server appears to be, and exactly what
+    SportyBet sent back. Used by /raw to debug blocks (e.g. HTTP 202)."""
+    out = []
+    try:
+        ip = requests.get("https://ipinfo.io/json", timeout=10).json()
+        out.append(f"Server IP: {ip.get('ip')} | {ip.get('country')} | {ip.get('org')}")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"IP lookup failed: {type(exc).__name__}")
+
+    resp = requests.get(
+        f"{BASE_URL}{code}",
+        params={"_t": int(time.time() * 1000)},
+        headers=HEADERS,
+        timeout=timeout,
+    )
+    out.append(f"HTTP {resp.status_code} | {len(resp.content)} bytes")
+    keep = ("content-type", "server", "biz-code", "biz-code-message",
+            "request-country", "x-cache", "via", "location", "retry-after")
+    for k, v in resp.headers.items():
+        if k.lower() in keep:
+            out.append(f"{k}: {v[:80]}")
+    body = resp.text[:300].replace("\n", " ") or "(empty body)"
+    out.append(f"Body: {body}")
+    return "\n".join(out)

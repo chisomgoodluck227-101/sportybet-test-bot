@@ -7,7 +7,7 @@ from telegram import Update
 from telegram.error import Conflict
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from decoder import SAMPLE_CODE, fetch_code, format_decoded, trim_code
+from decoder import SAMPLE_CODE, fetch_code, fetch_raw, format_decoded, trim_code
 from healthcheck import start_health_server
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -20,7 +20,8 @@ HELP = (
     "Send a share code or link, or use:\n"
     "/decode XML9Z7 – decode a code\n"
     "/test – decode the sample code from the PDF\n"
-    "/ping – check if SportyBet is reachable from this server"
+    "/ping – check if SportyBet is reachable from this server\n"
+    "/raw CODE – show server IP + raw SportyBet response (debug)"
 )
 
 
@@ -70,6 +71,15 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Not reachable: {type(exc).__name__}: {exc}")
 
 
+async def raw_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = trim_code(" ".join(context.args)) if context.args else SAMPLE_CODE
+    try:
+        text = await asyncio.to_thread(fetch_raw, code)
+        await update.message.reply_text(f"Code: {code}\n{text}"[:3900])
+    except requests.RequestException as exc:
+        await update.message.reply_text(f"❌ {type(exc).__name__}: {exc}"[:3900])
+
+
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await run_decode(update, update.message.text or "")
 
@@ -96,6 +106,7 @@ def main():
     app.add_handler(CommandHandler("decode", decode_command))
     app.add_handler(CommandHandler("test", test_command))
     app.add_handler(CommandHandler("ping", ping_command))
+    app.add_handler(CommandHandler("raw", raw_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
     app.add_error_handler(on_error)
     app.run_polling(drop_pending_updates=True)
